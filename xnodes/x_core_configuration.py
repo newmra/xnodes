@@ -16,6 +16,8 @@ class XCoreConfiguration:
     Configuration of the XCore.
     """
     log_level: int = logging.INFO
+    log_event_type: bool = False
+    log_sender_id: bool = True
     log_event_parameters: bool = True
     log_parameter_type_info: bool = False
     id_maximum_logging_length: int = 40

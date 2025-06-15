@@ -5,17 +5,16 @@ xnodes: Exchange nodes framework
 
 Author: Ralph Neumann (@newmra)
 """
-
 import inspect
 import logging
 import threading
 from collections import defaultdict
 from copy import copy
 from types import GeneratorType
-from typing import Callable, Optional, Dict, List, Set, Tuple, Union, Iterable, Any
+from typing import Callable, Optional, Dict, List, Set, Tuple, Iterable, Any
 
 from xnodes.x_core_configuration import XCoreConfiguration
-from xnodes.x_event import XEvent
+from xnodes.x_event import XEvent, EventType
 from xnodes.x_event_description import XEventDescription, XEventParameter
 from xnodes.x_event_listener import X_EVENT_LISTENER_FLAG, APPEND_SENDER_ID_FLAG
 from xnodes.x_node_exception import XNodeException
@@ -28,21 +27,19 @@ class IMainThreadDelegator:
     Interface for main thread delegators.
     """
 
-    def delegate_events(self, events: List[XEvent], is_undo: bool) -> None:
+    def delegate_events(self, events: List[XEvent]) -> None:
         """
         Delegate a list of events to the main thread.
         :param events: Events to delegate.
-        :param is_undo: Flag if the events are undo events.
-        :return:
+        :return: None
         """
         raise NotImplementedError()
 
-    def _delegate_events_to_main_thread(self, events: List[XEvent], is_undo: bool) -> None:
+    def _delegate_events_to_main_thread(self, events: List[XEvent]) -> None:
         """
         Delegate a list of events to the main thread.
         :param events: Events to delegate.
-        :param is_undo: Flag if the events are undo events.
-        :return:
+        :return: None
         """
         raise NotImplementedError()
 
@@ -50,8 +47,6 @@ class IMainThreadDelegator:
 X_CORE_NODE_ID = "X_CORE"
 
 X_CORE_START = "X_CORE_START"
-X_UNDO_EVENT = "X_UNDO_EVENT"
-X_REDO_EVENT = "X_REDO_EVENT"
 X_MAP_UNDO_REDO_COUNTERS = "X_MAP_UNDO_REDO_COUNTERS"
 X_CLEAR_UNDO_REDO_EVENTS = "X_CLEAR_UNDO_REDO_EVENTS"
 
@@ -63,23 +58,17 @@ _REDO_STACK: List[List[XEvent]] = []
 _NODE_IDS = {X_CORE_NODE_ID}
 
 _EVENT_SUBSCRIPTIONS: Dict[str, Set[str]] = defaultdict(set)
-_EVENT_SUBSCRIPTIONS[X_UNDO_EVENT].add(X_CORE_NODE_ID)
-_EVENT_SUBSCRIPTIONS[X_REDO_EVENT].add(X_CORE_NODE_ID)
 _EVENT_SUBSCRIPTIONS[X_CLEAR_UNDO_REDO_EVENTS].add(X_CORE_NODE_ID)
 
 # pylint: disable = unnecessary-lambda
 # Functions are declared later, so lambda is necessary.
 _EVENT_HANDLERS: Dict[Tuple[str, str], Callable] = {
-    (X_UNDO_EVENT, X_CORE_NODE_ID): lambda: _undo_events(),
-    (X_REDO_EVENT, X_CORE_NODE_ID): lambda: _redo_events(),
     (X_CLEAR_UNDO_REDO_EVENTS, X_CORE_NODE_ID): lambda: _clear_undo_redo_stacks()
 }
 # pylint: enable = unnecessary-lambda
 
 _EVENT_DESCRIPTIONS: Dict[str, XEventDescription] = {
     X_CORE_START: XEventDescription(set(), logging.INFO),
-    X_UNDO_EVENT: XEventDescription(set(), logging.INFO),
-    X_REDO_EVENT: XEventDescription(set(), logging.INFO),
     X_MAP_UNDO_REDO_COUNTERS: XEventDescription(
         {
             XEventParameter("undo_counter", int, "Number of undo events."),
@@ -108,14 +97,20 @@ def _get_parameter_names(event_description: XEventDescription) -> Set[str]:
     return event_parameters
 
 
-def _build_event(event_id: str, sender_id: str, receiver_id: str,
-                 parameters: Dict[str, object]) -> XEvent:
+def _build_event(
+        event_id: str,
+        sender_id: str,
+        receiver_id: str,
+        parameters: Dict[str, object],
+        event_type: EventType
+) -> XEvent:
     """
     Build an event with the given information.
     :param event_id: ID of the event.
     :param sender_id: ID of the sender node.
     :param receiver_id: ID of the receiver node.
     :param parameters: Parameters of the event.
+    :param event_type: Type of the event.
     :return: Constructed event.
     """
     if event_id not in _EVENT_DESCRIPTIONS:
@@ -132,7 +127,7 @@ def _build_event(event_id: str, sender_id: str, receiver_id: str,
             f"Event '{event_id}' cannot be constructed, event requires: [{event_parameters_string}], "
             f"provided are: [{provided_parameters_string}].")
 
-    return XEvent(event_id, event_description, sender_id, receiver_id, parameters)
+    return XEvent(event_id, event_description, sender_id, receiver_id, parameters, event_type)
 
 
 def register_event(event_id: str, parameters: Set[XEventParameter], log_level: int = logging.INFO) -> None:
@@ -260,8 +255,10 @@ def unregister_node(node_id: str) -> None:
     _NODE_IDS.remove(node_id)
 
 
-def start(x_core_configuration: Optional[XCoreConfiguration] = None,
-          main_thread_delegator: Optional[IMainThreadDelegator] = None) -> None:
+def start(
+        x_core_configuration: Optional[XCoreConfiguration] = None,
+        main_thread_delegator: Optional[IMainThreadDelegator] = None
+) -> None:
     """
     Start the core and send the X_CORE_START event to all nodes which subscribed to it.
     :param x_core_configuration: Core configuration.
@@ -312,7 +309,7 @@ def publish(event_id: str, sender_id: str, receiver_id: str, parameters: Dict[st
         raise XNodeException(f"{base_error_message}, but receiver '{receiver_id}' is not subscribed to event "
                              f"'{event_id}'.")
 
-    publish_events([_build_event(event_id, sender_id, receiver_id, parameters)], is_undo=False)
+    publish_events([_build_event(event_id, sender_id, receiver_id, parameters, EventType.DO)])
 
 
 def broadcast(event_id: str, sender_id: str, parameters: Dict[str, object]) -> None:
@@ -334,28 +331,43 @@ def broadcast(event_id: str, sender_id: str, parameters: Dict[str, object]) -> N
         raise XNodeException(f"{base_error_message}, but the sender node is not registered.")
 
     events = [
-        _build_event(event_id, sender_id, handler_id, parameters)
+        _build_event(event_id, sender_id, handler_id, parameters, EventType.DO)
         for handler_id in _EVENT_SUBSCRIPTIONS[event_id]
     ]
 
-    _log(_build_event(event_id, sender_id, "BROADCAST", parameters))
+    _log(_build_event(event_id, sender_id, "BROADCAST", parameters, EventType.DO))
 
     if not events:
         return
 
-    publish_events(events, is_undo=False)
+    publish_events(events)
 
 
-def add_undo_events(undo_events: List[XEvent]) -> None:
+def add_undo_event(event_id: str, receiver_id: str, parameters: Dict[str, object] or None = None) -> None:
     """
-    Add new undo events to the stack and clear the redo stack. This function can be used to add undo events
-    to changed which were not induced by events. Has to be used with care, because it can alter the event flow.
-    :param undo_events: Undo events to add.
+    Add a new undo event to the stack and clear the redo stack. This function can be used to add an undo event
+    to changes which were not induced by an event. Has to be used with care, because it can alter the event flow.
+    :param event_id: ID of the event to publish.
+    :param receiver_id: ID of the node which shall receive the event.
+    :param parameters: Parameters of the event. Have to match exactly the parameters of the event.
     :return: None
     """
-    _REDO_STACK.clear()
-    _append_undo_events(undo_events)
+    base_error_message = f"Attempted to add an undo event '{event_id}' addressed to node '{receiver_id}'"
 
+    if event_id not in _EVENT_DESCRIPTIONS:
+        raise XNodeException(f"{base_error_message}, but the event is not registered.")
+
+    if receiver_id not in _NODE_IDS:
+        raise XNodeException(f"{base_error_message}, but the receiver node is not registered.")
+
+    if (event_id, receiver_id) not in _EVENT_HANDLERS:
+        raise XNodeException(f"{base_error_message}, but receiver '{receiver_id}' is not subscribed to event "
+                             f"'{event_id}'.")
+
+    parameters = parameters or {}
+
+    _append_undo_event(_build_event(event_id, X_CORE_NODE_ID, receiver_id, parameters, EventType.UNDO))
+    _REDO_STACK.clear()
     _publish_undo_redo_counters()
 
 
@@ -377,8 +389,21 @@ def _create_base_logging_string(event: XEvent) -> str:
     :param event: Event to create the base logging string for.
     :return: Base logging string of the passed event.
     """
-    from_str = (" " * (_CONFIGURATION.id_maximum_logging_length - len(event.sender_id)) + event.sender_id)
+    if _CONFIGURATION.log_sender_id:
+        from_str = (" " * (_CONFIGURATION.id_maximum_logging_length - len(event.sender_id)) + event.sender_id)
+    else:
+        from_str = ""
+
     to_str = event.receiver_id + " " * (_CONFIGURATION.id_maximum_logging_length - len(event.receiver_id))
+
+    if _CONFIGURATION.log_event_type:
+        event_type_str = str(event.event_type.value)
+        if event.event_type == EventType.DO:
+            event_type_str = f" {event_type_str} "
+
+        event_type_str = f" | {event_type_str} |"
+    else:
+        event_type_str = ""
 
     remaining_dashes = _EVENT_LENGTH - len(event.id)
 
@@ -388,7 +413,7 @@ def _create_base_logging_string(event: XEvent) -> str:
     event_str += "-" * (remaining_dashes - remaining_dashes // 2)
     event_str += "->"
 
-    return f"{from_str} {event_str} {to_str}"
+    return f"{event_type_str} {from_str} {event_str} {to_str}"
 
 
 def _create_parameters_logging_string(event: XEvent) -> str:
@@ -429,6 +454,14 @@ class EventPublishingContext:
 
         self._events = events
 
+    @property
+    def is_first_event_in_batch(self) -> bool:
+        """
+        Check if this is the first event in the batch.
+        :return: True if this is the first event in the batch, False otherwise.
+        """
+        return self._is_first_event_in_batch
+
     def __enter__(self):
         """
         Enter the context. If no event is currently published, an empty line is logged to separate the event stack from
@@ -440,7 +473,7 @@ class EventPublishingContext:
 
         for event in self._events:
             if event.event_description.log_level >= _CONFIGURATION.log_level:
-                LOGGER.log(event.event_description.log_level, "")
+                LOGGER.log(event.event_description.log_level, "***")
                 break
 
         return self
@@ -458,48 +491,55 @@ class EventPublishingContext:
             _IS_EVENT_IN_PROGRESS = False
 
 
-def publish_events(events: List[XEvent], is_undo: bool) -> None:
+def publish_events(events: List[XEvent]) -> None:
     """
     Publish a list of events and return the undo events.
     :param events: Events to publish.
-    :param is_undo: Flag if the events are undo events.
     :return: None
     """
     if _is_main_thread():
-        publish_events_in_main_thread(events, is_undo)
+        publish_events_in_main_thread(events)
     elif isinstance(_MAIN_THREAD_DELEGATOR, IMainThreadDelegator):
-        _MAIN_THREAD_DELEGATOR.delegate_events(events, is_undo=False)
+        _MAIN_THREAD_DELEGATOR.delegate_events(events)
     else:
         raise XNodeException(
             "Attempted to broadcast events outside of the main thread, with no main thread delegator set.")
 
 
-def publish_events_in_main_thread(events: List[XEvent], is_undo: bool) -> None:
+def publish_events_in_main_thread(events: List[XEvent]) -> None:
     """
     Publish a list of events in the main thread.
     :param events: Events to publish.
-    :param is_undo: Flag if the events are undo events.
     :return: None
     """
     if not _is_main_thread():
         raise XNodeException("Attempted to publish events outside of the main thread.")
 
-    with EventPublishingContext(events):
-        undo_events = []
-
-        for event in events:
+    with EventPublishingContext(events) as context:
+        for i, event in enumerate(events):
             _log(event)
 
             undo_event_generator = _execute_event(event)
-            undo_events.extend(_extract_undo_events(undo_event_generator, event.receiver_id))
+            extracted_undo_event = _extract_undo_event(undo_event_generator, event.receiver_id, event.event_type)
+            if not isinstance(extracted_undo_event, XEvent):
+                continue
 
-        if undo_events:
-            if is_undo:
-                _REDO_STACK.append(list(reversed(undo_events)))
-            else:
-                _append_undo_events(list(reversed(undo_events)))
+            if i != 0 or not context.is_first_event_in_batch:
+                raise XNodeException("Undo event provided for an event which was not the first in the batch.")
 
-        if undo_events or is_undo:
+            if event.event_type == EventType.DO:
+                _REDO_STACK.clear()
+                _append_undo_event(extracted_undo_event)
+            elif event.event_type == EventType.UNDO:
+                _REDO_STACK.append([extracted_undo_event])
+            elif event.event_type == EventType.REDO:
+                _append_undo_event(extracted_undo_event)
+
+            further_undo_event = _extract_undo_event(undo_event_generator, event.receiver_id, event.event_type)
+
+            if further_undo_event is not None:
+                raise XNodeException(f"An event can only return a single undo event, but a second one was returned.")
+
             _publish_undo_redo_counters()
 
 
@@ -524,17 +564,17 @@ def _execute_event(event: XEvent) -> GeneratorType:
     return event_handler(**parameters)
 
 
-def _extract_undo_events(undo_event_iterable: Any, receiver_id: str) -> List[XEvent]:
+def _extract_undo_event(undo_event_iterable: Any, receiver_id: str, original_event_type: EventType) -> XEvent or None:
     """
     Extract the undo events from the given undo event iterable.
     :param undo_event_iterable: Undo event iterable to extract the undo events from.
     :param receiver_id: ID of the receiver node.
-    :return: Extracted undo events.
+    :param original_event_type: Type of the original event.
+    :return: Extracted undo event or None if no undo event is returned.
     """
     if not isinstance(undo_event_iterable, Iterable):
         return []
 
-    undo_events = []
     for undo_event in undo_event_iterable:
         if not isinstance(undo_event, tuple) or len(undo_event) != 2:
             raise XNodeException("Undo event has to be a tuple consisting of the event and the parameters.")
@@ -545,12 +585,20 @@ def _extract_undo_events(undo_event_iterable: Any, receiver_id: str) -> List[XEv
             raise XNodeException(f"Undo event parameters has an invalid type, should be dict, is: "
                                  f"'{type(undo_event_parameters).__name__}'.")
 
-        undo_events.append(_build_event(undo_event_id, receiver_id, receiver_id, undo_event_parameters))
+        if original_event_type == EventType.DO or original_event_type == EventType.REDO:
+            undo_event_type = EventType.UNDO
+        elif original_event_type == EventType.UNDO:
+            undo_event_type = EventType.REDO
+        else:
+            raise XNodeException(
+                f"Original event type '{original_event_type}' is not supported, expected 'DO' or 'UNDO'.")
 
-    return undo_events
+        return _build_event(undo_event_id, receiver_id, receiver_id, undo_event_parameters, undo_event_type)
+
+    return None
 
 
-def _undo_events() -> None:
+def undo() -> None:
     """
     Publish the last undo events and save the redo events to the redo stack.
     :return: None
@@ -558,10 +606,10 @@ def _undo_events() -> None:
     if not _UNDO_STACK:
         return
 
-    publish_events(_UNDO_STACK.pop(-1), is_undo=True)
+    publish_events(_UNDO_STACK.pop(-1))
 
 
-def _redo_events() -> None:
+def redo() -> None:
     """
     Perform the last redo events and save the undo events to the undo stack.
     :return: None
@@ -569,16 +617,16 @@ def _redo_events() -> None:
     if not _REDO_STACK:
         return
 
-    publish_events(_REDO_STACK.pop(-1), is_undo=False)
+    publish_events(_REDO_STACK.pop(-1))
 
 
-def _append_undo_events(undo_events: List[XEvent]) -> None:
+def _append_undo_event(undo_event: XEvent) -> None:
     """
-    Append new undo events.
-    :param undo_events: Undo events to append.
+    Append a new undo event.
+    :param undo_event: Undo event to append.
     :return: None
     """
-    _UNDO_STACK.append(undo_events)
+    _UNDO_STACK.append([undo_event])
     if _CONFIGURATION.maximum_undo_events < 0:
         return
 

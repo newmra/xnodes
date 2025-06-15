@@ -53,9 +53,9 @@ def _reset_x_core() -> None:
     x_core._EVENT_HANDLERS.clear()
     x_core._EVENT_HANDLERS.update({
         (x_core.X_UNDO_EVENT, x_core.X_CORE_NODE_ID):
-            x_core._undo_events,
+            x_core.undo,
         (x_core.X_REDO_EVENT, x_core.X_CORE_NODE_ID):
-            x_core._redo_events,
+            x_core.redo,
         (x_core.X_CLEAR_UNDO_REDO_EVENTS, x_core.X_CORE_NODE_ID):
             x_core._clear_undo_redo_stacks
     })
@@ -194,11 +194,10 @@ def test_register_event_raise_sender_id_in_parameters() -> None:
     XEventParameter(EVENT_ID_1), XEventParameter(EVENT_ID_1, description=EVENT_DESCRIPTION),
     XEventParameter(EVENT_ID_1, int),
     XEventParameter(EVENT_ID_1, int, EVENT_DESCRIPTION)
-],
-                         ids=[
-                             "Only parameter name", "Parameter name with description", "Parameter name with type",
-                             "Parameter name with type and description"
-                         ])
+], ids=[
+    "Only parameter name", "Parameter name with description", "Parameter name with type",
+    "Parameter name with type and description"
+])
 def test_register_event_valid_parameter(parameter) -> None:
     """
     Register an event and check that valid parameters can be set without a raised exception.
@@ -697,7 +696,7 @@ def test_undo_events(monkeypatch) -> None:
     publish_events_mock = MagicMock()
     monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
 
-    x_core._undo_events()
+    x_core.undo()
     publish_events_mock.assert_called_once_with(ANY, is_undo=True)
 
 
@@ -712,7 +711,7 @@ def test_undo_events_no_undo_events(monkeypatch) -> None:
     publish_events_mock = MagicMock()
     monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
 
-    x_core._undo_events()
+    x_core.undo()
     publish_events_mock.assert_not_called()
 
 
@@ -729,7 +728,7 @@ def test_redo_events(monkeypatch) -> None:
     publish_events_mock = MagicMock()
     monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
 
-    x_core._redo_events()
+    x_core.redo()
     publish_events_mock.assert_called_once_with(ANY, is_undo=False)
 
 
@@ -744,7 +743,7 @@ def test_redo_events_no_redo_events(monkeypatch) -> None:
     publish_events_mock = MagicMock()
     monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
 
-    x_core._redo_events()
+    x_core.redo()
     publish_events_mock.assert_not_called()
 
 
@@ -761,7 +760,7 @@ def test_append_undo_events() -> None:
     x_core._REDO_STACK.append([event])
     x_core._REDO_STACK.append([event])
 
-    x_core._append_undo_events([event])
+    x_core._append_undo_event([event])
     assert len(x_core._REDO_STACK) == 3
     assert len(x_core._UNDO_STACK) == 1
 
@@ -782,9 +781,9 @@ def test_append_undo_remove_oldest_undo_event() -> None:
         x_core._UNDO_STACK.append([other_event])
 
     assert len(x_core._UNDO_STACK) == 999
-    x_core._append_undo_events([first_event])
+    x_core._append_undo_event([first_event])
     assert len(x_core._UNDO_STACK) == 1000
-    x_core._append_undo_events([other_event])
+    x_core._append_undo_event([other_event])
     assert len(x_core._UNDO_STACK) == 1000
     assert x_core._UNDO_STACK[0][0] is not first_event
 
@@ -803,7 +802,7 @@ def test_append_undo_keep_all_undo_events() -> None:
     events_to_add = 100000
     for i in range(events_to_add):
         assert len(x_core._UNDO_STACK) == i
-        x_core._append_undo_events([event])
+        x_core._append_undo_event([event])
         assert len(x_core._UNDO_STACK) == i + 1
 
 
@@ -1300,7 +1299,7 @@ def test_extract_undo_events_not_a_generator() -> None:
     """
     _reset_x_core()
 
-    assert len(x_core._extract_undo_events(None, "")) == 0
+    assert len(x_core._extract_undo_event(None, "")) == 0
 
 
 @pytest.mark.parametrize("undo_event", [None, (None,), (None, None, None)],
@@ -1315,7 +1314,7 @@ def test_extract_undo_events_invalid_undo_event_type(undo_event) -> None:
 
     with pytest.raises(XNodeException,
                        match=re.escape("Undo event has to be a tuple consisting of the event and the parameters.")):
-        x_core._extract_undo_events(iter([undo_event]), "")
+        x_core._extract_undo_event(iter([undo_event]), "")
 
 
 def test_extract_undo_events_raise_invalid_parameters_type() -> None:
@@ -1327,7 +1326,7 @@ def test_extract_undo_events_raise_invalid_parameters_type() -> None:
 
     with pytest.raises(XNodeException,
                        match=re.escape("Undo event parameters has an invalid type, should be dict, is: 'int'.")):
-        x_core._extract_undo_events(iter([("test", 42)]), "")
+        x_core._extract_undo_event(iter([("test", 42)]), "")
 
 
 def test_extract_undo_events(monkeypatch) -> None:
@@ -1346,7 +1345,7 @@ def test_extract_undo_events(monkeypatch) -> None:
     build_event_mock.return_value = MagicMock()
     monkeypatch.setattr(x_core, "_build_event", build_event_mock)
 
-    assert len(x_core._extract_undo_events(iter([(EVENT_ID_1, parameters)]), NODE_ID_1)) == 1
+    assert len(x_core._extract_undo_event(iter([(EVENT_ID_1, parameters)]), NODE_ID_1)) == 1
     build_event_mock.assert_called_once_with(EVENT_ID_1, NODE_ID_1, NODE_ID_1, parameters)
 
 

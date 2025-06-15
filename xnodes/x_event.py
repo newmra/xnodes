@@ -5,11 +5,20 @@ xnodes: Exchange nodes framework
 
 Author: Ralph Neumann (@newmra)
 """
-
+import enum
 from dataclasses import dataclass
 from typing import Dict
 
 from xnodes import x_event_description
+
+
+class EventType(enum.Enum):
+    """
+    Enum for the event type.
+    """
+    DO = "DO"
+    UNDO = "UNDO"
+    REDO = "REDO"
 
 
 @dataclass
@@ -22,3 +31,4 @@ class XEvent:
     sender_id: str
     receiver_id: str
     parameters: Dict[str, object]
+    event_type: EventType = EventType.DO
