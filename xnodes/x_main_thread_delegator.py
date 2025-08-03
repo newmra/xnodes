@@ -6,22 +6,20 @@ xnodes: Exchange nodes framework
 Author: Ralph Neumann (@newmra)
 """
 
-from typing import List
-
 from xnodes import XEvent
-from xnodes.x_core import publish_events_in_main_thread, IMainThreadDelegator
+from xnodes.x_core import publish_event_in_main_thread
+from xnodes.i_x_main_thread_delegator import IXMainThreadDelegator
 
 
-class XMainThreadDelegator(IMainThreadDelegator):
+class XMainThreadDelegator(IXMainThreadDelegator):
     """
     Interface of classes which can delegate events to the main thread.
     """
 
-    def _delegate_events_to_main_thread(self, events: List[XEvent], is_undo: bool) -> None:
+    def _delegate_event_to_main_thread(self, event: XEvent) -> None:
         """
-        Delegate a list of events to the main thread.
-        :param events: Events to delegate.
-        :param is_undo: Flag if the events are undo events.
+        Delegate an event to the main thread.
+        :param event: Event to delegate.
         :return:
         """
-        publish_events_in_main_thread(events, is_undo)
+        publish_event_in_main_thread(event)

@@ -21,7 +21,7 @@ class EventType(enum.Enum):
     REDO = "REDO"
 
 
-@dataclass
+@dataclass(frozen=True)
 class XEvent:
     """
     Complete event which is sent from one node to another node.
@@ -32,3 +32,4 @@ class XEvent:
     receiver_id: str
     parameters: Dict[str, object]
     event_type: EventType = EventType.DO
+    is_broadcast: bool = False

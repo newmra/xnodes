@@ -18,14 +18,12 @@ def test_main_thread_delegation(monkeypatch):
     :return: None
     """
     event_1 = "event_1"
-    event_2 = "event_2"
 
     publish_event_in_main_thread_mock = MagicMock()
-
-    monkeypatch.setattr(x_main_thread_delegator, "publish_events_in_main_thread", publish_event_in_main_thread_mock)
+    monkeypatch.setattr(x_main_thread_delegator, "publish_event_in_main_thread", publish_event_in_main_thread_mock)
 
     main_thread_delegator = x_main_thread_delegator.XMainThreadDelegator()
 
     # noinspection PyTypeChecker
-    main_thread_delegator._delegate_events_to_main_thread([event_1, event_2], True)
-    publish_event_in_main_thread_mock.assert_called_once_with([event_1, event_2], True)
+    main_thread_delegator._delegate_event_to_main_thread(event_1)
+    publish_event_in_main_thread_mock.assert_called_once_with(event_1)

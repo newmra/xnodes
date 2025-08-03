@@ -5,17 +5,18 @@ xnodes: Exchange nodes framework
 
 Author: Ralph Neumann (@newmra)
 """
-
+import contextlib
 import logging
 import re
-from typing import List
-from unittest.mock import MagicMock, ANY, call
+from unittest.mock import MagicMock, ANY
 
 import pytest
 
 import xnodes
-from xnodes import x_core, XEventParameter, XCoreConfiguration, x_event_listener, XEvent, XMainThreadDelegator
-from xnodes.x_core import EventPublishingContext, IMainThreadDelegator
+from xnodes import x_core, XEventParameter, XCoreConfiguration, x_event_listener, X_MAP_UNDO_REDO_COUNTERS
+from xnodes.i_x_main_thread_delegator import IXMainThreadDelegator
+from xnodes.x_core import X_CORE_NODE_ID, EventPublishingContext
+from xnodes.x_event import EventType, XEvent
 from xnodes.x_event_description import XEventDescription
 from xnodes.x_node_exception import XNodeException
 
@@ -28,6 +29,8 @@ EVENT_DESCRIPTION = "EVENT_DESCRIPTION"
 
 EVENT_PARAMETER_NAME_1 = "parameter_1"
 EVENT_PARAMETER_NAME_2 = "parameter_2"
+
+TEST_EVENT = XEvent("TEST", XEventDescription(set()), "", "", {})
 
 
 # pylint: disable = protected-access
@@ -46,27 +49,11 @@ def _reset_x_core() -> None:
     x_core._NODE_IDS.add(x_core.X_CORE_NODE_ID)
 
     x_core._EVENT_SUBSCRIPTIONS.clear()
-    x_core._EVENT_SUBSCRIPTIONS[x_core.X_UNDO_EVENT].add(x_core.X_CORE_NODE_ID)
-    x_core._EVENT_SUBSCRIPTIONS[x_core.X_REDO_EVENT].add(x_core.X_CORE_NODE_ID)
-    x_core._EVENT_SUBSCRIPTIONS[x_core.X_CLEAR_UNDO_REDO_EVENTS].add(x_core.X_CORE_NODE_ID)
-
     x_core._EVENT_HANDLERS.clear()
-    x_core._EVENT_HANDLERS.update({
-        (x_core.X_UNDO_EVENT, x_core.X_CORE_NODE_ID):
-            x_core.undo,
-        (x_core.X_REDO_EVENT, x_core.X_CORE_NODE_ID):
-            x_core.redo,
-        (x_core.X_CLEAR_UNDO_REDO_EVENTS, x_core.X_CORE_NODE_ID):
-            x_core._clear_undo_redo_stacks
-    })
 
     x_core._EVENT_DESCRIPTIONS.clear()
     x_core._EVENT_DESCRIPTIONS.update({
         x_core.X_CORE_START:
-            xnodes.x_event_description.XEventDescription(set(), x_core.logging.INFO),
-        x_core.X_UNDO_EVENT:
-            xnodes.x_event_description.XEventDescription(set(), x_core.logging.INFO),
-        x_core.X_REDO_EVENT:
             xnodes.x_event_description.XEventDescription(set(), x_core.logging.INFO),
 
         # (Args: Undo counter, redo counter)
@@ -74,10 +61,10 @@ def _reset_x_core() -> None:
             xnodes.x_event_description.XEventDescription(
                 {XEventParameter("undo_counter", int), XEventParameter("redo_counter", int)},
                 x_core.logging.INFO),
-        x_core.X_CLEAR_UNDO_REDO_EVENTS:
-            xnodes.x_event_description.XEventDescription(set(), x_core.logging.INFO)
     })
 
+    x_core._MINIMUM_ID_MAXIMUM_LOGGING_LENGTH = 10
+    x_core._LAST_EVENT_LOG_LENGTH = 0
     x_core._EVENT_LENGTH = 24
     x_core._IS_EVENT_IN_PROGRESS = False
     x_core._CONFIGURATION = XCoreConfiguration()
@@ -385,7 +372,19 @@ def test_unregister_node() -> None:
     x_core.register_event(EVENT_ID_1, set())
     x_core.register_event(EVENT_ID_2, set())
 
-    class Node:
+    class Node1:
+        """
+        Dummy node.
+        """
+
+        @x_event_listener(EVENT_ID_1)
+        def handler(self) -> None:
+            """
+            Dummy handler.
+            :return: None
+            """
+
+    class Node2:
         """
         Dummy node.
         """
@@ -397,8 +396,9 @@ def test_unregister_node() -> None:
             :return: None
             """
 
-    x_core.register_node(NODE_ID_1, Node())
-    x_core.unregister_node(NODE_ID_1)
+    x_core.register_node(NODE_ID_1, Node1())
+    x_core.register_node(NODE_ID_2, Node2())
+    x_core.unregister_node(NODE_ID_2)
 
 
 def test_start_raise_invalid_maximum_logging_length() -> None:
@@ -427,7 +427,7 @@ def test_start_raise_invalid_main_thread_delegator() -> None:
 
     with pytest.raises(
             XNodeException,
-            match=re.escape("Main thread delegator has to be of type 'IMainThreadDelegator'.")):
+            match=re.escape("Main thread delegator has to be of type 'IXMainThreadDelegator'.")):
         # noinspection PyTypeChecker
         x_core.start(main_thread_delegator=42)
 
@@ -546,8 +546,8 @@ def test_publish(monkeypatch) -> None:
     x_core.register_node(NODE_ID_1, Node())
     x_core.register_node(NODE_ID_2, Node())
 
-    publish_events_mock = MagicMock()
-    monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
+    publish_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_event", publish_event_mock)
 
     built_event = "BUILT_EVENT"
     build_event_mock = MagicMock()
@@ -555,8 +555,8 @@ def test_publish(monkeypatch) -> None:
     monkeypatch.setattr(x_core, "_build_event", build_event_mock)
 
     x_core.publish(EVENT_ID_1, NODE_ID_1, NODE_ID_2, {})
-    build_event_mock.assert_called_once_with(EVENT_ID_1, NODE_ID_1, NODE_ID_2, {})
-    publish_events_mock.assert_called_once_with([built_event], is_undo=False)
+    build_event_mock.assert_called_once_with(EVENT_ID_1, NODE_ID_1, NODE_ID_2, {}, EventType.DO, )
+    publish_event_mock.assert_called_once_with(built_event)
 
 
 def test_broadcast_raise_event_not_registered() -> None:
@@ -614,8 +614,8 @@ def test_broadcast(monkeypatch) -> None:
     x_core.register_node(NODE_ID_1, MagicMock())
     x_core.register_node(NODE_ID_2, Node())
 
-    publish_events_mock = MagicMock()
-    monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
+    publish_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_event", publish_event_mock)
 
     log_mock = MagicMock()
     monkeypatch.setattr(x_core, "_log", log_mock)
@@ -626,10 +626,9 @@ def test_broadcast(monkeypatch) -> None:
     monkeypatch.setattr(x_core, "_build_event", build_event_mock)
 
     x_core.broadcast(EVENT_ID_1, NODE_ID_1, {})
-    build_event_mock.assert_has_calls([call(EVENT_ID_1, NODE_ID_1, NODE_ID_2, {}),
-                                       call(EVENT_ID_1, NODE_ID_1, "BROADCAST", {})])
-    log_mock.assert_called_once()
-    publish_events_mock.assert_called_once_with([built_event], is_undo=False)
+    build_event_mock.assert_called_once_with(EVENT_ID_1, NODE_ID_1, NODE_ID_2, {}, EventType.DO, is_broadcast=True)
+    log_mock.assert_not_called()
+    publish_event_mock.assert_called_once_with(built_event)
 
 
 def test_broadcast_no_receiver(monkeypatch) -> None:
@@ -643,8 +642,8 @@ def test_broadcast_no_receiver(monkeypatch) -> None:
     x_core.register_event(EVENT_ID_1, set())
     x_core.register_node(NODE_ID_1, MagicMock())
 
-    publish_events_mock = MagicMock()
-    monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
+    publish_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_event", publish_event_mock)
 
     build_event_mock = MagicMock()
     monkeypatch.setattr(x_core, "_build_event", build_event_mock)
@@ -656,113 +655,136 @@ def test_broadcast_no_receiver(monkeypatch) -> None:
     monkeypatch.setattr(x_core, "_log", log_mock)
 
     x_core.broadcast(EVENT_ID_1, NODE_ID_1, {})
-    build_event_mock.assert_called_once_with(EVENT_ID_1, NODE_ID_1, "BROADCAST", {})
-    log_mock.assert_called_once()
-    publish_events_mock.assert_not_called()
+    build_event_mock.assert_not_called()
+    log_mock.assert_not_called()
+    publish_event_mock.assert_not_called()
 
 
-def test_add_undo_events(monkeypatch) -> None:
-    """
-    Test 'add_undo_events' and check the redo stack is cleared if an undo event is added.
-    :param monkeypatch: Monkeypatch.
-    :return: None
-    """
+def test__add_undo_event__raise_invalid_event_id() -> None:
     _reset_x_core()
 
-    x_core._REDO_STACK.append([XEvent("TEST", XEventDescription(set()), "", "", {})])
+    with pytest.raises(XNodeException, match=re.escape(
+            f"Attempted to add an undo event '{EVENT_ID_1}' addressed to node "
+            f"'{NODE_ID_1}', but the event is not registered."
+    )):
+        x_core.add_undo_event(EVENT_ID_1, NODE_ID_1)
 
-    append_undo_events_mock = MagicMock()
-    monkeypatch.setattr(x_core, "_append_undo_events", append_undo_events_mock)
 
-    publish_undo_redo_counters_mock = MagicMock()
-    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
+def test__add_undo_event__raise_invalid_receiver_id() -> None:
+    _reset_x_core()
 
-    x_core.add_undo_events([])
+    x_core._EVENT_DESCRIPTIONS[EVENT_ID_1] = XEventDescription(set())
+
+    with pytest.raises(XNodeException, match=re.escape(
+            f"Attempted to add an undo event '{EVENT_ID_1}' addressed to node "
+            f"'{NODE_ID_1}', but the receiver node is not registered."
+    )):
+        x_core.add_undo_event(EVENT_ID_1, NODE_ID_1)
+
+
+def test__add_undo_event__raise_receiver_not_subscribed() -> None:
+    _reset_x_core()
+
+    x_core._EVENT_DESCRIPTIONS[EVENT_ID_1] = XEventDescription(set())
+    x_core._NODE_IDS.add(NODE_ID_1)
+
+    with pytest.raises(XNodeException, match=re.escape(
+            f"Attempted to add an undo event '{EVENT_ID_1}' addressed to node "
+            f"'{NODE_ID_1}', but receiver is not subscribed to event."
+    )):
+        x_core.add_undo_event(EVENT_ID_1, NODE_ID_1)
+
+
+def test__add_undo_event__undo_event_added(monkeypatch) -> None:
+    _reset_x_core()
+
+    x_core._EVENT_DESCRIPTIONS[EVENT_ID_1] = XEventDescription(set())
+    x_core._NODE_IDS.add(NODE_ID_1)
+    x_core._EVENT_HANDLERS[(EVENT_ID_1, NODE_ID_1)] = MagicMock()
+    x_core._REDO_STACK.append(MagicMock())
+
+    build_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_build_event", build_event_mock)
+
+    broadcast_mock = MagicMock()
+    monkeypatch.setattr(x_core, "broadcast", broadcast_mock)
+
+    build_event_mock.return_value = MagicMock()
+
+    # Adding a new undo event should remove any existing redo events, because the
+    assert len(x_core._REDO_STACK) != 0
+    assert len(x_core._UNDO_STACK) == 0
+
+    x_core.add_undo_event(EVENT_ID_1, NODE_ID_1)
+    build_event_mock.assert_called_once_with(EVENT_ID_1, x_core.X_CORE_NODE_ID, NODE_ID_1, {}, EventType.UNDO)
+    broadcast_mock.assert_called_once_with(X_MAP_UNDO_REDO_COUNTERS, X_CORE_NODE_ID, ANY)
+
     assert len(x_core._REDO_STACK) == 0
-    append_undo_events_mock.assert_called_once_with([])
-    publish_undo_redo_counters_mock.assert_called_once()
+    assert len(x_core._UNDO_STACK) != 0
 
 
-def test_undo_events(monkeypatch) -> None:
+def test__undo__do_nothing_if_no_undo_events(monkeypatch) -> None:
     """
-    Test '_undo_events' and check the undo events are published.
+    Test 'undo' and check that nothing happens if no undo events are available.
     :param monkeypatch: Monkeypatch.
     :return: None
     """
     _reset_x_core()
 
-    x_core._UNDO_STACK.append([XEvent("TEST", XEventDescription(set()), "", "", {})])
-
-    publish_events_mock = MagicMock()
-    monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
+    publish_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_event", publish_event_mock)
 
     x_core.undo()
-    publish_events_mock.assert_called_once_with(ANY, is_undo=True)
+    publish_event_mock.assert_not_called()
 
 
-def test_undo_events_no_undo_events(monkeypatch) -> None:
+def test__undo__publish_undo_event(monkeypatch) -> None:
     """
-    Test '_undo_events' and check that nothing happens if not undo events are available.
+    Test 'undo' and check that the undo event is published.
     :param monkeypatch: Monkeypatch.
     :return: None
     """
     _reset_x_core()
 
-    publish_events_mock = MagicMock()
-    monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
+    x_core._UNDO_STACK.append(MagicMock())
+
+    publish_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_event", publish_event_mock)
 
     x_core.undo()
-    publish_events_mock.assert_not_called()
+    publish_event_mock.assert_called_once()
 
 
-def test_redo_events(monkeypatch) -> None:
+def test__redo__do_nothing_if_no_redo_events(monkeypatch) -> None:
     """
-    Test '_redo_events' and check the redo events are published.
+    Test 'redo' and check that nothing happens if no redo events are available.
     :param monkeypatch: Monkeypatch.
     :return: None
     """
     _reset_x_core()
 
-    x_core._REDO_STACK.append([XEvent("TEST", XEventDescription(set()), "", "", {})])
-
-    publish_events_mock = MagicMock()
-    monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
+    publish_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_event", publish_event_mock)
 
     x_core.redo()
-    publish_events_mock.assert_called_once_with(ANY, is_undo=False)
+    publish_event_mock.assert_not_called()
 
 
-def test_redo_events_no_redo_events(monkeypatch) -> None:
+def test__redo__publish_redo_event(monkeypatch) -> None:
     """
-    Test '_redo_events' and check that nothing happens if not redo events are available.
+    Test 'redo' and check that the redo event is published.
     :param monkeypatch: Monkeypatch.
     :return: None
     """
     _reset_x_core()
 
-    publish_events_mock = MagicMock()
-    monkeypatch.setattr(x_core, "publish_events", publish_events_mock)
+    x_core._REDO_STACK.append(MagicMock())
+
+    publish_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_event", publish_event_mock)
 
     x_core.redo()
-    publish_events_mock.assert_not_called()
-
-
-def test_append_undo_events() -> None:
-    """
-    Test '_append_undo_events' and check that undo events are appended.
-    :return: None
-    """
-    _reset_x_core()
-
-    event = XEvent("TEST", XEventDescription(set()), "", "", {})
-
-    x_core._REDO_STACK.append([event])
-    x_core._REDO_STACK.append([event])
-    x_core._REDO_STACK.append([event])
-
-    x_core._append_undo_event([event])
-    assert len(x_core._REDO_STACK) == 3
-    assert len(x_core._UNDO_STACK) == 1
+    publish_event_mock.assert_called_once()
 
 
 def test_append_undo_remove_oldest_undo_event() -> None:
@@ -776,16 +798,16 @@ def test_append_undo_remove_oldest_undo_event() -> None:
     first_event = XEvent("TEST", XEventDescription(set()), "", "", {})
     other_event = XEvent("TEST", XEventDescription(set()), "", "", {})
 
-    x_core._UNDO_STACK.append([first_event])
+    x_core._UNDO_STACK.append(first_event)
     for _ in range(998):
-        x_core._UNDO_STACK.append([other_event])
+        x_core._UNDO_STACK.append(other_event)
 
     assert len(x_core._UNDO_STACK) == 999
-    x_core._append_undo_event([first_event])
+    x_core._append_undo_event(other_event)
     assert len(x_core._UNDO_STACK) == 1000
-    x_core._append_undo_event([other_event])
+    x_core._append_undo_event(other_event)
     assert len(x_core._UNDO_STACK) == 1000
-    assert x_core._UNDO_STACK[0][0] is not first_event
+    assert x_core._UNDO_STACK[0] is not first_event
 
 
 def test_append_undo_keep_all_undo_events() -> None:
@@ -802,7 +824,7 @@ def test_append_undo_keep_all_undo_events() -> None:
     events_to_add = 100000
     for i in range(events_to_add):
         assert len(x_core._UNDO_STACK) == i
-        x_core._append_undo_event([event])
+        x_core._append_undo_event(event)
         assert len(x_core._UNDO_STACK) == i + 1
 
 
@@ -819,10 +841,10 @@ def test_clear_undo_redo_stack(monkeypatch) -> None:
 
     event = XEvent("TEST", XEventDescription(set()), "", "", {})
 
-    x_core._UNDO_STACK.append([event])
-    x_core._REDO_STACK.append([event])
+    x_core._UNDO_STACK.append(event)
+    x_core._REDO_STACK.append(event)
 
-    x_core._clear_undo_redo_stacks()
+    x_core.clear_undo_redo_stacks()
     assert len(x_core._UNDO_STACK) == 0
     assert len(x_core._REDO_STACK) == 0
     publish_undo_redo_counters_mock.assert_called_once()
@@ -845,10 +867,10 @@ def test_publish_undo_redo_counters(monkeypatch) -> None:
     redo_count = 21
 
     for _ in range(undo_count):
-        x_core._UNDO_STACK.append([event])
+        x_core._UNDO_STACK.append(event)
 
     for _ in range(redo_count):
-        x_core._REDO_STACK.append([event])
+        x_core._REDO_STACK.append(event)
 
     x_core._publish_undo_redo_counters()
     broadcast_mock.assert_called_once_with(x_core.X_MAP_UNDO_REDO_COUNTERS, x_core.X_CORE_NODE_ID, {
@@ -866,7 +888,7 @@ def test_build_event_raise_event_not_registered() -> None:
 
     with pytest.raises(XNodeException,
                        match=re.escape(f"Attempted to create an unknown event '{EVENT_ID_1}'.")):
-        x_core._build_event(EVENT_ID_1, NODE_ID_1, NODE_ID_2, {})
+        x_core._build_event(EVENT_ID_1, NODE_ID_1, NODE_ID_2, {}, EventType.DO)
 
 
 def test_build_event_raise_event_parameter_not_matching() -> None:
@@ -890,7 +912,8 @@ def test_build_event_raise_event_parameter_not_matching() -> None:
         x_core._build_event(EVENT_ID_1, NODE_ID_1, NODE_ID_2, {
             provided_parameter_1: 42,
             provided_parameter_2: "test"
-        })
+        },
+                            EventType.DO)
 
 
 def test_build_event() -> None:
@@ -906,7 +929,7 @@ def test_build_event() -> None:
     event = x_core._build_event(EVENT_ID_1, NODE_ID_1, NODE_ID_2, {
         EVENT_PARAMETER_NAME_1: 42,
         EVENT_PARAMETER_NAME_2: "test"
-    })
+    }, EventType.DO)
 
     assert event.id == EVENT_ID_1
     assert event.sender_id == NODE_ID_1
@@ -940,31 +963,6 @@ def test_log(monkeypatch) -> None:
 
     x_core._log(event_mock)
     log_mock.assert_called_once_with(logging.INFO, f"{base_logging_string}{parameters_logging_string}")
-
-
-def test_create_base_logging_string(monkeypatch) -> None:
-    """
-    Test '_create_base_logging_string' and check that the base logging string is created correctly.
-    :param monkeypatch: Monkeypatch.
-    :return: None
-    """
-    _reset_x_core()
-
-    id_maximum_logging_length = 20
-
-    configuration_mock = MagicMock()
-    configuration_mock.id_maximum_logging_length = id_maximum_logging_length
-    configuration_mock.log_event_parameters = False
-    monkeypatch.setattr(x_core, "_CONFIGURATION", configuration_mock)
-
-    event_mock = MagicMock()
-    event_mock.sender_id = NODE_ID_1
-    event_mock.receiver_id = NODE_ID_2
-    event_mock.id = EVENT_ID_1
-    event_mock.event_description.log_level = logging.INFO
-
-    base_logging_string = x_core._create_base_logging_string(event_mock)
-    assert base_logging_string == f"           {NODE_ID_1} --------- {EVENT_ID_1} --------> {NODE_ID_2}           "
 
 
 def test_create_parameters_logging_string(monkeypatch) -> None:
@@ -1025,150 +1023,6 @@ def test_log_with_parameters_empty_if_no_parameters_are_available(monkeypatch) -
     assert x_core._create_parameters_logging_string(event_mock) == ""
 
 
-def test_publish_events_no_undo_events_but_is_undo(monkeypatch) -> None:
-    """
-    Test '_publish_events' and check that no redo event is added if no redo event is provided.
-    :param monkeypatch: Monkeypatch.
-    :return: None
-    """
-    _reset_x_core()
-
-    event_mock = MagicMock()
-    event_mock.receiver_id = NODE_ID_1
-
-    monkeypatch.setattr(x_core, "EventPublishingContext", MagicMock())
-    monkeypatch.setattr(x_core, "_log", MagicMock())
-    monkeypatch.setattr(x_core, "_execute_event", MagicMock())
-    monkeypatch.setattr(x_core, "_extract_undo_events", MagicMock())
-
-    publish_undo_redo_counters_mock = MagicMock()
-    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
-
-    assert len(x_core._REDO_STACK) == 0
-    x_core.publish_events([event_mock], is_undo=True)
-    assert len(x_core._REDO_STACK) == 0
-    publish_undo_redo_counters_mock.assert_called_once()
-
-
-def test_publish_events_no_undo_events_is_not_undo(monkeypatch) -> None:
-    """
-    Test '_publish_events' and check that no undo and redo counters are published if no undo events are provided.
-    :param monkeypatch: Monkeypatch.
-    :return: None
-    """
-    _reset_x_core()
-
-    event_mock = MagicMock()
-    event_mock.receiver_id = NODE_ID_1
-
-    monkeypatch.setattr(x_core, "_log", MagicMock())
-    monkeypatch.setattr(x_core, "_execute_event", MagicMock())
-    monkeypatch.setattr(x_core, "_extract_undo_events", MagicMock())
-
-    event_publishing_context_mock = MagicMock()
-    monkeypatch.setattr(x_core, "EventPublishingContext", event_publishing_context_mock)
-
-    publish_undo_redo_counters_mock = MagicMock()
-    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
-
-    x_core.publish_events([event_mock], is_undo=False)
-    publish_undo_redo_counters_mock.assert_not_called()
-
-
-def test_publish_events_undo_events_is_undo(monkeypatch) -> None:
-    """
-    Test '_publish_events' and check that the undo and redo counters are published if a redo event is added.
-    :param monkeypatch: Monkeypatch.
-    :return: None
-    """
-    _reset_x_core()
-
-    event_mock = MagicMock()
-    event_mock.receiver_id = NODE_ID_1
-
-    monkeypatch.setattr(x_core, "EventPublishingContext", MagicMock())
-    monkeypatch.setattr(x_core, "_log", MagicMock())
-    monkeypatch.setattr(x_core, "_execute_event", MagicMock())
-
-    extract_undo_events_mock = MagicMock()
-    extract_undo_events_mock.return_value = [event_mock]
-    monkeypatch.setattr(x_core, "_extract_undo_events", extract_undo_events_mock)
-
-    publish_undo_redo_counters_mock = MagicMock()
-    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
-
-    assert len(x_core._REDO_STACK) == 0
-    x_core.publish_events([event_mock], is_undo=True)
-    assert len(x_core._REDO_STACK) == 1
-    publish_undo_redo_counters_mock.assert_called_once()
-
-
-def test_publish_events_undo_events_is_not_undo(monkeypatch) -> None:
-    """
-    Test '_publish_events' and check that an undo event is added if an event is published.
-    :param monkeypatch: Monkeypatch.
-    :return: None
-    """
-    _reset_x_core()
-
-    event_mock = MagicMock()
-    event_mock.receiver_id = NODE_ID_1
-
-    monkeypatch.setattr(x_core, "EventPublishingContext", MagicMock())
-    monkeypatch.setattr(x_core, "_log", MagicMock())
-    monkeypatch.setattr(x_core, "_execute_event", MagicMock())
-
-    extract_undo_events_mock = MagicMock()
-    extract_undo_events_mock.return_value = [event_mock]
-    monkeypatch.setattr(x_core, "_extract_undo_events", extract_undo_events_mock)
-
-    publish_undo_redo_counters_mock = MagicMock()
-    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
-
-    append_undo_events_mock = MagicMock()
-    monkeypatch.setattr(x_core, "_append_undo_events", append_undo_events_mock)
-
-    assert len(x_core._REDO_STACK) == 0
-    x_core.publish_events([event_mock], is_undo=False)
-    assert len(x_core._REDO_STACK) == 0
-    append_undo_events_mock.assert_called_once()
-    publish_undo_redo_counters_mock.assert_called_once()
-
-
-def test_publish_events_delegate_to_main_thread(monkeypatch) -> None:
-    """
-    Test '_publish_events' and check that the event is delegated to the main thread.
-    :param monkeypatch: Monkeypatch.
-    :return: None
-    """
-    _reset_x_core()
-
-    class MainThreadDelegator(XMainThreadDelegator):
-
-        def __init__(self):
-            self.events = []
-            self.is_undo = False
-
-        def delegate_events(self, events: List[XEvent], is_undo: bool) -> None:
-            self.events = events
-            self.is_undo = is_undo
-
-    test_events = ["EVENT_1", "EVENT_2"]
-
-    main_thread_delegator = MainThreadDelegator()
-    monkeypatch.setattr(x_core, "_MAIN_THREAD_DELEGATOR", main_thread_delegator)
-
-    is_main_thread_mock = MagicMock()
-    is_main_thread_mock.return_value = False
-    monkeypatch.setattr(x_core, "_is_main_thread", is_main_thread_mock)
-
-    # noinspection PyTypeChecker
-    x_core.publish_events(test_events, False)
-
-    assert main_thread_delegator.events == test_events
-    assert not main_thread_delegator.is_undo
-
-
 def test_publish_events_raise_not_main_thread_and_no_delegator(monkeypatch) -> None:
     """
     Test '_publish_events' and check that an exception is raised if events are published not in the main thread and no
@@ -1184,7 +1038,7 @@ def test_publish_events_raise_not_main_thread_and_no_delegator(monkeypatch) -> N
 
     with pytest.raises(XNodeException, match=re.escape(
             "Attempted to broadcast events outside of the main thread, with no main thread delegator set.")):
-        x_core.publish_events([], False)
+        x_core._publish_event(MagicMock())
 
 
 def test_publish_events_in_main_thread_raise_not_main_thread(monkeypatch) -> None:
@@ -1202,7 +1056,7 @@ def test_publish_events_in_main_thread_raise_not_main_thread(monkeypatch) -> Non
 
     with pytest.raises(XNodeException, match=re.escape(
             "Attempted to publish events outside of the main thread.")):
-        x_core.publish_events_in_main_thread([], False)
+        x_core.publish_event_in_main_thread(MagicMock())
 
 
 def test_i_main_thread_delegator_interface() -> None:
@@ -1210,11 +1064,9 @@ def test_i_main_thread_delegator_interface() -> None:
     Test 'IMainThreadDelegator' and check that the interface raises an exception if the method is not implemented.
     :return: None
     """
-    main_thread_delegator = IMainThreadDelegator()
+    main_thread_delegator = IXMainThreadDelegator()
     with pytest.raises(NotImplementedError):
-        main_thread_delegator.delegate_events([], False)
-    with pytest.raises(NotImplementedError):
-        main_thread_delegator._delegate_events_to_main_thread([], False)
+        main_thread_delegator.delegate_event(MagicMock())
 
 
 def test_execute_event_raise_event_not_subscribed() -> None:
@@ -1225,6 +1077,7 @@ def test_execute_event_raise_event_not_subscribed() -> None:
     _reset_x_core()
 
     event_mock = MagicMock()
+    event_mock.event_type = EventType.DO
     event_mock.id = EVENT_ID_1
     event_mock.receiver_id = NODE_ID_1
 
@@ -1279,6 +1132,7 @@ def test_execute_event() -> None:
     x_core.register_node(NODE_ID_1, node)
 
     event_mock = MagicMock()
+    event_mock.event_type = EventType.DO
     event_mock.id = EVENT_ID_1
     event_mock.sender_id = NODE_ID_2
     event_mock.receiver_id = NODE_ID_1
@@ -1292,109 +1146,631 @@ def test_execute_event() -> None:
     assert node.is_called
 
 
-def test_extract_undo_events_not_a_generator() -> None:
-    """
-    Test '_extract_undo_events' and check that no undo events are created if the undo event is not a generator.
-    :return: None
-    """
+def test_execute_event__log_error_if_original_event_type_is_unknown(monkeypatch):
+    logger_error_mock = MagicMock()
+    monkeypatch.setattr(x_core.LOGGER, "error", logger_error_mock)
+
+    event_mock = MagicMock()
+    event_mock.event_type.value = "UNKNOWN"
+
+    assert x_core._execute_event(event_mock) is None
+
+    logger_error_mock.assert_called_once_with("**** XNODES INTERNAL FRAMEWORK ERROR **** Unknown event type: UNKNOWN.")
+
+
+def test_execute_event__raise_undo_event_no_tuple():
     _reset_x_core()
 
-    assert len(x_core._extract_undo_event(None, "")) == 0
+    def test_generator():
+        yield 42
+
+    event_mock = MagicMock()
+    event_mock.event_type = EventType.DO
+    event_mock.sender_id = NODE_ID_1
+    event_mock.receiver_id = NODE_ID_2
+    event_mock.id = EVENT_ID_1
+
+    x_core._EVENT_HANDLERS[(EVENT_ID_1, NODE_ID_2)] = test_generator
+
+    with pytest.raises(XNodeException, match=re.escape(
+            "Attempted to set an undo event, but the undo event data is not a tuple.")):
+        x_core._execute_event(event_mock)
 
 
-@pytest.mark.parametrize("undo_event", [None, (None,), (None, None, None)],
-                         ids=["Not a tuple", "Too few elements", "Too many elements"])
-def test_extract_undo_events_invalid_undo_event_type(undo_event) -> None:
-    """
-    Test '_extract_undo_events' and check that an exception is raised if the undo event has an invalid type.
-    :param undo_event: Undo event to test.
-    :return: None
-    """
+def test_execute_event__raise_undo_event_not_a_tuple_of_two_elements():
     _reset_x_core()
 
-    with pytest.raises(XNodeException,
-                       match=re.escape("Undo event has to be a tuple consisting of the event and the parameters.")):
-        x_core._extract_undo_event(iter([undo_event]), "")
+    def test_generator():
+        yield 42, 21, 1
+
+    event_mock = MagicMock()
+    event_mock.event_type = EventType.DO
+    event_mock.sender_id = NODE_ID_1
+    event_mock.receiver_id = NODE_ID_2
+    event_mock.id = EVENT_ID_1
+
+    x_core._EVENT_HANDLERS[(EVENT_ID_1, NODE_ID_2)] = test_generator
+
+    with pytest.raises(XNodeException, match=re.escape(
+            "Attempted to set an undo event, but the undo event data has to many values to unpack, expected "
+            "are 2 (Event-ID, Parameters-Dict) values, provided are 3 values.")):
+        x_core._execute_event(event_mock)
 
 
-def test_extract_undo_events_raise_invalid_parameters_type() -> None:
-    """
-    Test '_extract_undo_events' and check that an exception is raised if the undo parameter have an invalid type.
-    :return: None
-    """
+def test_execute_event__raise_event_id_not_a_string():
     _reset_x_core()
 
-    with pytest.raises(XNodeException,
-                       match=re.escape("Undo event parameters has an invalid type, should be dict, is: 'int'.")):
-        x_core._extract_undo_event(iter([("test", 42)]), "")
+    def test_generator():
+        yield 42, 21
+
+    event_mock = MagicMock()
+    event_mock.event_type = EventType.DO
+    event_mock.sender_id = NODE_ID_1
+    event_mock.receiver_id = NODE_ID_2
+    event_mock.id = EVENT_ID_1
+
+    x_core._EVENT_HANDLERS[(EVENT_ID_1, NODE_ID_2)] = test_generator
+
+    with pytest.raises(XNodeException, match=re.escape(
+            "Attempted to set an undo event, but undo event is not a str, is: 'int'.")):
+        x_core._execute_event(event_mock)
 
 
-def test_extract_undo_events(monkeypatch) -> None:
-    """
-    Test '_extract_undo_events' and check that an undo event is built.
-    :param monkeypatch: Monkeypatch.
-    :return: None
-    """
+def test_execute_event__raise_event_is_not_registered():
     _reset_x_core()
 
-    parameters = {
-        "test": 42
-    }
+    def test_generator():
+        yield EVENT_ID_1, 21
+
+    event_mock = MagicMock()
+    event_mock.event_type = EventType.DO
+    event_mock.sender_id = NODE_ID_1
+    event_mock.receiver_id = NODE_ID_2
+    event_mock.id = EVENT_ID_1
+
+    x_core._EVENT_HANDLERS[(EVENT_ID_1, NODE_ID_2)] = test_generator
+
+    with pytest.raises(XNodeException, match=re.escape(
+            f"Attempted to set an undo event, but undo event '{EVENT_ID_1}' is not registered.")):
+        x_core._execute_event(event_mock)
+
+
+def test_execute_event__raise_parameters_not_a_dict():
+    _reset_x_core()
+
+    def test_generator():
+        yield EVENT_ID_2, 21
+
+    event_mock = MagicMock()
+    event_mock.event_type = EventType.DO
+    event_mock.sender_id = NODE_ID_1
+    event_mock.receiver_id = NODE_ID_2
+    event_mock.id = EVENT_ID_1
+
+    x_core._EVENT_HANDLERS[(EVENT_ID_1, NODE_ID_2)] = test_generator
+    x_core._EVENT_DESCRIPTIONS[EVENT_ID_2] = XEventDescription(set())
+
+    with pytest.raises(XNodeException, match=re.escape(
+            "Attempted to set an undo event, but undo event parameters is not a dict, is: 'int'.")):
+        x_core._execute_event(event_mock)
+
+
+def test_execute_event__raise_multiple_undo_events_yielded():
+    _reset_x_core()
+
+    def test_generator():
+        yield EVENT_ID_1, dict()
+        yield EVENT_ID_2, dict()
+
+    event_mock = MagicMock()
+    event_mock.event_type = EventType.DO
+    event_mock.sender_id = NODE_ID_1
+    event_mock.receiver_id = NODE_ID_2
+    event_mock.id = EVENT_ID_1
+
+    x_core._EVENT_HANDLERS[(EVENT_ID_1, NODE_ID_2)] = test_generator
+    x_core._EVENT_DESCRIPTIONS[EVENT_ID_1] = XEventDescription(set())
+    x_core._EVENT_DESCRIPTIONS[EVENT_ID_2] = XEventDescription(set())
+
+    with pytest.raises(XNodeException, match=re.escape(
+            "Attempted to set an undo event, but an event can only return a single undo event, a second "
+            "one was yielded.")):
+        x_core._execute_event(event_mock)
+
+
+@pytest.mark.parametrize("original_event_type, undo_event_type", [
+    (EventType.DO, EventType.UNDO),
+    (EventType.REDO, EventType.UNDO),
+    (EventType.UNDO, EventType.REDO)
+])
+def test_execute_event__build_undo_event_from_do_event(
+        original_event_type: EventType, undo_event_type: EventType, monkeypatch):
+    _reset_x_core()
+
+    event_instance_mock = MagicMock()
 
     build_event_mock = MagicMock()
-    build_event_mock.return_value = MagicMock()
+    build_event_mock.return_value = event_instance_mock
     monkeypatch.setattr(x_core, "_build_event", build_event_mock)
 
-    assert len(x_core._extract_undo_event(iter([(EVENT_ID_1, parameters)]), NODE_ID_1)) == 1
-    build_event_mock.assert_called_once_with(EVENT_ID_1, NODE_ID_1, NODE_ID_1, parameters)
+    undo_event_parameters = {
+        "a": 42,
+        "b": 21
+    }
+
+    def test_generator():
+        yield EVENT_ID_1, undo_event_parameters
+
+    event_mock = MagicMock()
+    event_mock.event_type = original_event_type
+    event_mock.sender_id = NODE_ID_1
+    event_mock.receiver_id = NODE_ID_2
+    event_mock.id = EVENT_ID_1
+
+    x_core._EVENT_HANDLERS[(EVENT_ID_1, NODE_ID_2)] = test_generator
+    x_core._EVENT_DESCRIPTIONS[EVENT_ID_1] = XEventDescription(set())
+    x_core._execute_event(event_mock)
+
+    build_event_mock.assert_called_once_with(EVENT_ID_1, NODE_ID_2, NODE_ID_2, undo_event_parameters, undo_event_type)
 
 
-def test_event_publishing_context_no_log_if_logging_level_too_high(monkeypatch) -> None:
+def test_event_publishing_context_single_event(monkeypatch) -> None:
     """
-    Test 'EventPublishingContext' and check that no empty line is logged if no log level of any event is higher than
-    the configured log level.
-    :param monkeypatch: Monkeypatch.
-    :return: None
+    Test EventPublishingContext with a single event, verifying state changes and logging on exit.
     """
     _reset_x_core()
 
-    event_mock = MagicMock()
-    event_mock.event_description.log_level = logging.DEBUG
+    log_info_mock = MagicMock()
+    monkeypatch.setattr(x_core.LOGGER, "info", log_info_mock)
+
+    x_core._CONFIGURATION.log_level = logging.DEBUG
+
+    assert not x_core._IS_EVENT_IN_PROGRESS
+
+    with EventPublishingContext() as context:
+        assert context.is_first_event_in_batch
+        assert x_core._IS_EVENT_IN_PROGRESS
+        assert x_core._LAST_EVENT_LOG_LENGTH == -1
+
+        x_core._LAST_EVENT_LOG_LENGTH = 50
+
+    log_info_mock.assert_called_once_with("*" * 50)
+    assert not x_core._IS_EVENT_IN_PROGRESS
+
+
+def test_event_publishing_context_nested_events(monkeypatch) -> None:
+    """
+    Test EventPublishingContext with nested events, verifying only the outermost context logs and resets state.
+    """
+    _reset_x_core()
+
+    log_info_mock = MagicMock()
+    monkeypatch.setattr(x_core.LOGGER, "info", log_info_mock)
+
+    x_core._CONFIGURATION.log_level = logging.DEBUG
+
+    assert not x_core._IS_EVENT_IN_PROGRESS
+
+    with EventPublishingContext() as outer_context:
+        assert outer_context.is_first_event_in_batch
+        assert x_core._IS_EVENT_IN_PROGRESS
+        assert x_core._LAST_EVENT_LOG_LENGTH == -1
+
+        with EventPublishingContext() as inner_context:
+            assert not inner_context.is_first_event_in_batch
+            assert x_core._IS_EVENT_IN_PROGRESS
+
+        log_info_mock.assert_not_called()
+        assert x_core._IS_EVENT_IN_PROGRESS
+
+        x_core._LAST_EVENT_LOG_LENGTH = 70
+
+    log_info_mock.assert_called_once_with("*" * 70)
+    assert not x_core._IS_EVENT_IN_PROGRESS
+
+
+def test_event_publishing_context_exit_no_log_if_log_level_too_low(monkeypatch) -> None:
+    """
+    Test EventPublishingContext does not log on exit if the event's log level is below the configuration's threshold.
+    """
+    _reset_x_core()
 
     log_mock = MagicMock()
     monkeypatch.setattr(x_core.LOGGER, "log", log_mock)
 
-    configuration_mock = MagicMock()
-    configuration_mock.log_level = logging.INFO
-    monkeypatch.setattr(x_core, "_CONFIGURATION", configuration_mock)
+    x_core._CONFIGURATION.log_level = logging.WARNING
 
-    with EventPublishingContext([event_mock]):
-        pass
+    with EventPublishingContext():
+        assert x_core._IS_EVENT_IN_PROGRESS
+        x_core._LAST_EVENT_LOG_LENGTH = 50
 
     log_mock.assert_not_called()
+    assert not x_core._IS_EVENT_IN_PROGRESS
 
 
-def test_event_publishing_context(monkeypatch) -> None:
+def test_event_publishing_context_exit_no_log_if_last_log_length_negative(monkeypatch) -> None:
     """
-    Test 'EventPublishingContext' and check if an empty line is logged only once if the context is nested.
-    :param monkeypatch: Monkeypatch.
-    :return: None
+    Test EventPublishingContext does not log on exit if no logging occurred within the context
+    (i.e., _LAST_EVENT_LOG_LENGTH remains negative).
     """
     _reset_x_core()
-
-    event_mock = MagicMock()
-    event_mock.event_description.log_level = logging.DEBUG
 
     log_mock = MagicMock()
     monkeypatch.setattr(x_core.LOGGER, "log", log_mock)
 
-    configuration_mock = MagicMock()
-    configuration_mock.log_level = logging.DEBUG
-    monkeypatch.setattr(x_core, "_CONFIGURATION", configuration_mock)
+    x_core._CONFIGURATION.log_level = logging.DEBUG
 
-    with EventPublishingContext([event_mock]):
-        # Second context within the first context should not log an empty line again.
-        with EventPublishingContext([event_mock]):
-            pass
+    with EventPublishingContext():
+        assert x_core._LAST_EVENT_LOG_LENGTH == -1
 
-    log_mock.assert_called_once()
+    log_mock.assert_not_called()
+    assert not x_core._IS_EVENT_IN_PROGRESS
+
+
+def test_create_base_logging_string_full_logging(monkeypatch):
+    _reset_x_core()
+
+    x_core._CONFIGURATION.log_sender_id = True
+    x_core._CONFIGURATION.log_event_type = True
+    x_core._CONFIGURATION.id_maximum_logging_length = 12
+    x_core._EVENT_LENGTH = 26
+    x_core._LAST_EVENT_LOG_LENGTH = -1
+
+    event_mock = MagicMock()
+    event_mock.sender_id = "SENDER_A"
+    event_mock.receiver_id = "RECEIVER_B"
+    event_mock.id = "EVENT_ID"
+    event_mock.event_type = EventType.DO
+
+    expected = "|  DO  |     SENDER_A ----------- EVENT_ID ----------> RECEIVER_B  "
+    result = x_core._create_base_logging_string(event_mock)
+    assert result == expected
+
+
+def test_create_base_logging_string_no_sender(monkeypatch):
+    _reset_x_core()
+
+    x_core._CONFIGURATION.log_sender_id = False
+    x_core._CONFIGURATION.log_event_type = True
+    x_core._CONFIGURATION.id_maximum_logging_length = 12
+    x_core._EVENT_LENGTH = 26
+    x_core._LAST_EVENT_LOG_LENGTH = -1
+
+    event_mock = MagicMock()
+    event_mock.sender_id = "SENDER_A"
+    event_mock.receiver_id = "RECEIVER_B"
+    event_mock.id = "EVENT_ID"
+    event_mock.event_type = EventType.DO
+
+    expected = "|  DO  |  ----------- EVENT_ID ----------> RECEIVER_B  "
+    result = x_core._create_base_logging_string(event_mock)
+    assert result == expected
+
+
+def test_create_base_logging_string_no_event_type(monkeypatch):
+    _reset_x_core()
+
+    x_core._CONFIGURATION.log_sender_id = True
+    x_core._CONFIGURATION.log_event_type = False
+    x_core._CONFIGURATION.id_maximum_logging_length = 12
+    x_core._EVENT_LENGTH = 26
+    x_core._LAST_EVENT_LOG_LENGTH = -1
+
+    event_mock = MagicMock()
+    event_mock.sender_id = "SENDER_A"
+    event_mock.receiver_id = "RECEIVER_B"
+    event_mock.id = "EVENT_ID"
+    event_mock.event_type = EventType.DO
+
+    expected = "     SENDER_A ----------- EVENT_ID ----------> RECEIVER_B  "
+    result = x_core._create_base_logging_string(event_mock)
+    assert result == expected
+
+
+def test_create_base_logging_string_batched_event(monkeypatch):
+    _reset_x_core()
+
+    x_core._CONFIGURATION.log_sender_id = True
+    x_core._CONFIGURATION.log_event_type = True
+    x_core._CONFIGURATION.id_maximum_logging_length = 12
+    x_core._EVENT_LENGTH = 26
+
+    event_mock = MagicMock()
+    event_mock.sender_id = "SENDER_A"
+    event_mock.receiver_id = "RECEIVER_B"
+    event_mock.id = "EVENT_ID"
+    event_mock.event_type = EventType.DO
+
+    expected = "|      |     SENDER_A ----------- EVENT_ID ----------> RECEIVER_B  "
+    result = x_core._create_base_logging_string(event_mock)
+    assert result == expected
+
+
+def test_create_base_logging_string_non_do_event(monkeypatch):
+    _reset_x_core()
+
+    x_core._CONFIGURATION.log_sender_id = True
+    x_core._CONFIGURATION.log_event_type = True
+    x_core._CONFIGURATION.id_maximum_logging_length = 12
+    x_core._EVENT_LENGTH = 26
+    x_core._LAST_EVENT_LOG_LENGTH = -1
+
+    event_mock = MagicMock()
+    event_mock.sender_id = "SENDER_A"
+    event_mock.receiver_id = "RECEIVER_B"
+    event_mock.id = "EVENT_ID"
+    event_mock.event_type = EventType.UNDO
+
+    expected = "| UNDO |     SENDER_A ----------- EVENT_ID ----------> RECEIVER_B  "
+    result = x_core._create_base_logging_string(event_mock)
+    assert result == expected
+
+
+def test_publish_event_in_main_thread(monkeypatch) -> None:
+    _reset_x_core()
+
+    monkeypatch.setattr(x_core, "_is_main_thread", lambda: True)
+    publish_event_in_main_thread_mock = MagicMock()
+    monkeypatch.setattr(x_core, "publish_event_in_main_thread", publish_event_in_main_thread_mock)
+
+    event = TEST_EVENT
+    x_core._publish_event(event)
+
+    publish_event_in_main_thread_mock.assert_called_once_with(event)
+
+
+def test_publish_event_delegates_event_if_not_in_main_thread(monkeypatch) -> None:
+    _reset_x_core()
+
+    monkeypatch.setattr(x_core, "_is_main_thread", lambda: False)
+    mock_delegator = MagicMock(spec=IXMainThreadDelegator)
+    monkeypatch.setattr(x_core, "_MAIN_THREAD_DELEGATOR", mock_delegator)
+
+    event = TEST_EVENT
+    x_core._publish_event(event)
+
+    mock_delegator.delegate_event.assert_called_once_with(event)
+
+
+def test_publish_event_raises_exception_if_not_in_main_thread_and_no_delegator(monkeypatch) -> None:
+    _reset_x_core()
+
+    monkeypatch.setattr(x_core, "_is_main_thread", lambda: False)
+    monkeypatch.setattr(x_core, "_MAIN_THREAD_DELEGATOR", None)
+
+    with pytest.raises(XNodeException, match=re.escape(
+            "Attempted to broadcast events outside of the main thread, with no main thread delegator set.")):
+        x_core._publish_event(TEST_EVENT)
+
+
+def test_publish_event_in_main_thread__no_undo_event(monkeypatch):
+    _reset_x_core()
+
+    monkeypatch.setattr(x_core, "EventPublishingContext", contextlib.nullcontext)
+
+    is_main_thread_mock = MagicMock()
+    is_main_thread_mock.return_value = True
+    monkeypatch.setattr(x_core, "_is_main_thread", is_main_thread_mock)
+
+    log_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_log", log_mock)
+
+    execute_event_mock = MagicMock()
+    execute_event_mock.return_value = None
+    monkeypatch.setattr(x_core, "_execute_event", execute_event_mock)
+
+    publish_undo_redo_counters_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
+
+    event_mock = MagicMock()
+
+    x_core.publish_event_in_main_thread(event_mock)
+
+    log_mock.assert_called_once_with(event_mock)
+    execute_event_mock.assert_called_once_with(event_mock)
+
+
+def test_publish_event_in_main_thread__raise_undo_event_in_broadcast(monkeypatch):
+    _reset_x_core()
+
+    monkeypatch.setattr(x_core, "EventPublishingContext", contextlib.nullcontext)
+
+    is_main_thread_mock = MagicMock()
+    is_main_thread_mock.return_value = True
+    monkeypatch.setattr(x_core, "_is_main_thread", is_main_thread_mock)
+
+    log_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_log", log_mock)
+
+    execute_event_mock = MagicMock()
+    execute_event_mock.return_value = MagicMock(spec=XEvent)
+    monkeypatch.setattr(x_core, "_execute_event", execute_event_mock)
+
+    publish_undo_redo_counters_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
+
+    event_mock = MagicMock()
+    event_mock.is_broadcast = True
+
+    with pytest.raises(XNodeException, match=re.escape(
+            "Attempted to set an undo event, which is not supported for broadcast events.")):
+        x_core.publish_event_in_main_thread(event_mock)
+
+
+def test_publish_event_in_main_thread__raise_event_not_first_in_batch(monkeypatch):
+    _reset_x_core()
+
+    mock_context = MagicMock()
+    mock_context.is_first_event_in_batch = False
+
+    mock_context_manager = MagicMock()
+    mock_context_manager.return_value.__enter__.return_value = mock_context
+
+    monkeypatch.setattr(x_core, "EventPublishingContext", mock_context_manager)
+
+    is_main_thread_mock = MagicMock()
+    is_main_thread_mock.return_value = True
+    monkeypatch.setattr(x_core, "_is_main_thread", is_main_thread_mock)
+
+    log_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_log", log_mock)
+
+    execute_event_mock = MagicMock()
+    execute_event_mock.return_value = MagicMock(spec=XEvent)
+    monkeypatch.setattr(x_core, "_execute_event", execute_event_mock)
+
+    publish_undo_redo_counters_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
+
+    event_mock = MagicMock()
+    event_mock.is_broadcast = False
+
+    with pytest.raises(XNodeException, match=re.escape(
+            "Attempted to set an undo event, but the event is not the first in the batch.")):
+        x_core.publish_event_in_main_thread(event_mock)
+
+
+def test_publish_event_in_main_thread__undo_event_of_do(monkeypatch):
+    _reset_x_core()
+
+    mock_context = MagicMock()
+    mock_context.is_first_event_in_batch = True
+
+    mock_context_manager = MagicMock()
+    mock_context_manager.return_value.__enter__.return_value = mock_context
+
+    monkeypatch.setattr(x_core, "EventPublishingContext", mock_context_manager)
+
+    is_main_thread_mock = MagicMock()
+    is_main_thread_mock.return_value = True
+    monkeypatch.setattr(x_core, "_is_main_thread", is_main_thread_mock)
+
+    log_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_log", log_mock)
+
+    undo_event_mock = MagicMock(spec=XEvent)
+
+    execute_event_mock = MagicMock()
+    execute_event_mock.return_value = undo_event_mock
+    monkeypatch.setattr(x_core, "_execute_event", execute_event_mock)
+
+    publish_undo_redo_counters_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
+
+    redo_stack_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_REDO_STACK", redo_stack_mock)
+
+    append_undo_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_append_undo_event", append_undo_event_mock)
+
+    event_mock = MagicMock()
+    event_mock.is_broadcast = False
+    event_mock.event_type = EventType.DO
+
+    x_core.publish_event_in_main_thread(event_mock)
+
+    redo_stack_mock.clear.assert_called_once()
+    redo_stack_mock.append.assert_not_called()
+    append_undo_event_mock.assert_called_once_with(undo_event_mock)
+    publish_undo_redo_counters_mock.assert_called_once()
+
+
+def test_publish_event_in_main_thread__undo_event_of_undo(monkeypatch):
+    _reset_x_core()
+
+    mock_context = MagicMock()
+    mock_context.is_first_event_in_batch = True
+
+    mock_context_manager = MagicMock()
+    mock_context_manager.return_value.__enter__.return_value = mock_context
+
+    monkeypatch.setattr(x_core, "EventPublishingContext", mock_context_manager)
+
+    is_main_thread_mock = MagicMock()
+    is_main_thread_mock.return_value = True
+    monkeypatch.setattr(x_core, "_is_main_thread", is_main_thread_mock)
+
+    log_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_log", log_mock)
+
+    undo_event_mock = MagicMock(spec=XEvent)
+
+    execute_event_mock = MagicMock()
+    execute_event_mock.return_value = undo_event_mock
+    monkeypatch.setattr(x_core, "_execute_event", execute_event_mock)
+
+    publish_undo_redo_counters_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
+
+    redo_stack_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_REDO_STACK", redo_stack_mock)
+
+    append_undo_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_append_undo_event", append_undo_event_mock)
+
+    event_mock = MagicMock()
+    event_mock.is_broadcast = False
+    event_mock.event_type = EventType.UNDO
+
+    x_core.publish_event_in_main_thread(event_mock)
+
+    redo_stack_mock.clear.assert_not_called()
+    redo_stack_mock.append.assert_called_once_with(undo_event_mock)
+    append_undo_event_mock.assert_not_called()
+    publish_undo_redo_counters_mock.assert_called_once()
+
+
+def test_publish_event_in_main_thread__undo_event_of_redo(monkeypatch):
+    _reset_x_core()
+
+    mock_context = MagicMock()
+    mock_context.is_first_event_in_batch = True
+
+    mock_context_manager = MagicMock()
+    mock_context_manager.return_value.__enter__.return_value = mock_context
+
+    monkeypatch.setattr(x_core, "EventPublishingContext", mock_context_manager)
+
+    is_main_thread_mock = MagicMock()
+    is_main_thread_mock.return_value = True
+    monkeypatch.setattr(x_core, "_is_main_thread", is_main_thread_mock)
+
+    log_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_log", log_mock)
+
+    undo_event_mock = MagicMock(spec=XEvent)
+
+    execute_event_mock = MagicMock()
+    execute_event_mock.return_value = undo_event_mock
+    monkeypatch.setattr(x_core, "_execute_event", execute_event_mock)
+
+    publish_undo_redo_counters_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_publish_undo_redo_counters", publish_undo_redo_counters_mock)
+
+    redo_stack_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_REDO_STACK", redo_stack_mock)
+
+    append_undo_event_mock = MagicMock()
+    monkeypatch.setattr(x_core, "_append_undo_event", append_undo_event_mock)
+
+    event_mock = MagicMock()
+    event_mock.is_broadcast = False
+    event_mock.event_type = EventType.REDO
+
+    x_core.publish_event_in_main_thread(event_mock)
+
+    redo_stack_mock.clear.assert_not_called()
+    redo_stack_mock.append.assert_not_called()
+    append_undo_event_mock.assert_called_once_with(undo_event_mock)
+    publish_undo_redo_counters_mock.assert_called_once()
+
+
+def test_is_main_thread__execution(monkeypatch):
+    thread_mock_instance = MagicMock()
+
+    threading_mock = MagicMock()
+    threading_mock.current_thread.return_value = thread_mock_instance
+    threading_mock.main_thread.return_value = thread_mock_instance
+    monkeypatch.setattr(x_core, "threading", threading_mock)
+
+    assert x_core._is_main_thread()
